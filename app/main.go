@@ -6,6 +6,22 @@ import (
 	"os"
 )
 
+func handleConnection(conn net.Conn) {
+	defer conn.Close()
+	buffer := make([]byte, 1024)
+
+	for {
+		n, err := conn.Read(buffer)
+		if err != nil {
+			return
+		}
+		input := string(buffer[:n])
+		if input == "*1\r\n$4\r\nPING\r\n" {
+			conn.Write([]byte("+PONG\r\n"))
+		}
+	}
+}
+
 // Ensures gofmt doesn't remove the "net" and "os" imports in stage 1 (feel free to remove this!)
 var _ = net.Listen
 var _ = os.Exit
@@ -21,28 +37,15 @@ func main() {
 		fmt.Println("Failed to bind to port 6379")
 		os.Exit(1)
 	}
+	defer l.Close()
 
 	for {
-
 		conn, err := l.Accept() //go's short variable declaration := declares and assigns at the same time
 		if err != nil {
 			fmt.Println("Error accepting connection: ", err.Error())
-			os.Exit(1)
+			continue
+			//os.Exit(1)
 		}
-
-		//FOREVER:
-		//	read input from conn
-		//	if input is PING:
-		//	write "+PONG\r\n" to conn
-		buffer := make([]byte, 1024)
-
-		for {
-			n, _ := conn.Read(buffer)
-			input := string(buffer[:n])
-			if input == "*1\r\n$4\r\nPING\r\n" {
-				conn.Write([]byte("+PONG\r\n"))
-			}
-
-		}
+		go handleConnection(conn)
 	}
 }
