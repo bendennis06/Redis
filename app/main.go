@@ -29,6 +29,20 @@ func main() {
 			fmt.Println("Error accepting connection: ", err.Error())
 			os.Exit(1)
 		}
-		conn.Write([]byte("+PONG\r\n"))
+
+		//FOREVER:
+		//	read input from conn
+		//	if input is PING:
+		//	write "+PONG\r\n" to conn
+		buffer := make([]byte, 1024)
+
+		for {
+			n, _ := conn.Read(buffer)
+			input := string(buffer[:n])
+			if input == "PING\r\n" {
+				conn.Write([]byte("+PONG\r\n"))
+			}
+
+		}
 	}
 }
