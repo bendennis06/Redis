@@ -39,7 +39,7 @@ func main() {
 		for {
 			n, _ := conn.Read(buffer)
 			input := string(buffer[:n])
-			if input == "PING\r\n" {
+			if input == "*1\r\n$4\r\nPING\r\n" {
 				conn.Write([]byte("+PONG\r\n"))
 			}
 
