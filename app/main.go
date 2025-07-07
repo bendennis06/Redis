@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Take the raw bytes (or string) your server reads from the connection.
@@ -66,6 +67,7 @@ func handleConnection(conn net.Conn) {
 	defer conn.Close()
 	buffer := make([]byte, 1024)
 	dataMap := make(map[string]string)
+	expiryMap := make(map[string]time.Time)
 
 	for {
 		n, err := conn.Read(buffer)
@@ -90,35 +92,51 @@ func handleConnection(conn net.Conn) {
 			conn.Write([]byte(response))                                            // return formatted string
 		}
 
-		if len(commands) == 3 && strings.ToUpper(commands[0]) == "SET" {
-			response := Set(commands, dataMap)
+		if strings.ToUpper(commands[0]) == "SET" {
+			response := Set(commands, dataMap, expiryMap)
 			conn.Write([]byte(response))
 		}
 
-		if len(commands) == 2 && strings.ToUpper(commands[0]) == "GET" {
-			response := Get(commands, dataMap)
+		if strings.ToUpper(commands[0]) == "GET" {
+			response := Get(commands, dataMap, expiryMap)
 			conn.Write([]byte(response))
 		}
 	}
 }
 
-func Set(commands []string, dataMap map[string]string) string {
+func Set(commands []string, dataMap map[string]string, expiryMap map[string]time.Time) string {
 	//ex set name ben
-	if len(commands) != 3 {
+	if len(commands) != 3 && len(commands) != 5 {
 		return "Error, wrong length for set command"
 	}
 	key := commands[1]
 	value := commands[2]
 	dataMap[key] = value
+
+	if len(commands) == 5 && strings.ToUpper(commands[3]) == "PX" {
+		milliStr := commands[4]
+		milliSec, err := strconv.Atoi(milliStr) //covert time to an int
+		if err != nil {
+			return "ERROR: px value must be an int"
+		}
+		expiryMap[key] = time.Now().Add(time.Duration(milliSec) * time.Millisecond) //covert time conversion to seconds relative to current time and store in new map
+	}
 	return "+OK\r\n"
 }
 
-func Get(commands []string, dataMap map[string]string) string {
+func Get(commands []string, dataMap map[string]string, expiryMap map[string]time.Time) string {
 	//ex get name
 	if len(commands) != 2 {
 		return "ERROR: wrong length for get command"
 	}
 	key := commands[1]
+
+	if expTime, ok := expiryMap[key]; ok && time.Now().After(expTime) {
+		delete(dataMap, key) //delete entries in maps
+		delete(expiryMap, key)
+		return "$-1\r\n"
+	}
+
 	value, ok := dataMap[key]
 	if !ok {
 		return "$-1\r\n" //null bulk string
