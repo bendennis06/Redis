@@ -65,6 +65,7 @@ func parseRESP(b []byte) ([]string, error) {
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 	buffer := make([]byte, 1024)
+	dataMap := make(map[string]string)
 
 	for {
 		n, err := conn.Read(buffer)
@@ -88,10 +89,42 @@ func handleConnection(conn net.Conn) {
 			response := fmt.Sprintf("$%d\r\n%s\r\n", len(commands[1]), commands[1]) //build a formatted string
 			conn.Write([]byte(response))                                            // return formatted string
 		}
-		//if input == "*1\r\n$4\r\nPING\r\n" {
-		//	conn.Write([]byte("+PONG\r\n"))
-		//}
+
+		if len(commands) == 3 && strings.ToUpper(commands[0]) == "SET" {
+			response := Set(commands, dataMap)
+			conn.Write([]byte(response))
+		}
+
+		if len(commands) == 2 && strings.ToUpper(commands[0]) == "GET" {
+			response := Get(commands, dataMap)
+			conn.Write([]byte(response))
+		}
 	}
+}
+
+func Set(commands []string, dataMap map[string]string) string {
+	//ex set name ben
+	if len(commands) != 3 {
+		return "Error, wrong length for set command"
+	}
+	key := commands[1]
+	value := commands[2]
+	dataMap[key] = value
+	return "+OK\r\n"
+}
+
+func Get(commands []string, dataMap map[string]string) string {
+	//ex get name
+	if len(commands) != 2 {
+		return "ERROR: wrong length for get command"
+	}
+	key := commands[1]
+	value, ok := dataMap[key]
+	if !ok {
+		return "$-1\r\n" //null bulk string
+	}
+	return fmt.Sprintf("$%d\r\n%s\r\n", len(value), value) //format
+
 }
 
 // Ensures gofmt doesn't remove the "net" and "os" imports in stage 1 (feel free to remove this!)
@@ -99,6 +132,7 @@ var _ = net.Listen
 var _ = os.Exit
 
 func main() {
+
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
 	fmt.Println("Logs from your program will appear here!")
 
