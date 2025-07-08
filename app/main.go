@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	_ "go/types"
 	"net"
@@ -9,6 +10,10 @@ import (
 	"strings"
 	"time"
 )
+
+// expect a --dir argument and store in dir variable
+var dir = flag.String("dir", "", "Directory where RDB file is stored")
+var dbfilename = flag.String("dbfilename", "", "Name of the RDB file")
 
 // Take the raw bytes (or string) your server reads from the connection.
 // Parse the Redis RESP protocol.
@@ -69,6 +74,11 @@ func handleConnection(conn net.Conn) {
 	dataMap := make(map[string]string)
 	expiryMap := make(map[string]time.Time)
 
+	configCom := map[string]string{ //config command; store string vals here
+		"dir":        *dir,
+		"dbfilename": *dbfilename,
+	}
+
 	for {
 		n, err := conn.Read(buffer)
 		if err != nil {
@@ -99,6 +109,17 @@ func handleConnection(conn net.Conn) {
 
 		if strings.ToUpper(commands[0]) == "GET" {
 			response := Get(commands, dataMap, expiryMap)
+			conn.Write([]byte(response))
+		}
+
+		if strings.ToUpper(commands[0]) == "CONFIG" && strings.ToUpper(commands[1]) == "GET" && len(commands) == 3 {
+			parameter := commands[2]
+			value, ok := configCom[parameter]
+			if !ok {
+				conn.Write([]byte("$-1\r\n"))
+				continue
+			}
+			response := fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(parameter), parameter, len(value), value)
 			conn.Write([]byte(response))
 		}
 	}
@@ -150,11 +171,10 @@ var _ = net.Listen
 var _ = os.Exit
 
 func main() {
+	flag.Parse() //parse input for command vals(RDB)
 
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
 	fmt.Println("Logs from your program will appear here!")
-
-	// Uncomment this block to pass the first stage
 
 	l, err := net.Listen("tcp", "0.0.0.0:6379")
 	if err != nil {
