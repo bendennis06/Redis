@@ -180,104 +180,44 @@ func readRDB(filePath string) (map[string]string, map[string]time.Time, error) {
 
 	//check: do we start with "REDIS" and version 0011? else abort
 	data, err := os.ReadFile(filePath)
+	//dataLength := len(data)
+	//results := []string{}
+	fmt.Println(data)
+	fmt.Println(string(data))
+
 	if err != nil {
 		return dataMap, dataMapTime, nil
 	}
 	if len(data) < 9 {
 		return dataMap, dataMapTime, nil
 	}
-	fmt.Println("Magic:", string(data[:9])) //debug
-	if string(data[:9]) != "REDIS0011" {    //covert to string and check if valid magic number
+
+	//fmt.Println("Magic:", string(data[:9])) //debug
+	if string(data[:9]) != "REDIS0011" {
 		return dataMap, dataMapTime, nil
 	}
-	//skip past metadata section
+
 	index := 9
-	for index < len(data) && data[index] == 0xFA {
+
+	for index < len(data) && data[index] != 0xFB {
 		index++
-		fmt.Printf("found metadata at %d\n", index) //debug
-		_, err := readString(data, &index)          //read key
-		if err != nil {
-			return dataMap, dataMapTime, nil
-		}
 
-		_, err = readString(data, &index) //read value
-		if err != nil {
-			return dataMap, dataMapTime, nil
-		}
 	}
+	fmt.Printf("we here → index=%d, byte=0x%X\n", index, data[index]) // at 0xFB
+	index += 4
 
-	if index < len(data) && data[index] == 0xFE {
-		index++
-		index++
+	key, err := readString(data, &index)
+	if err != nil {
+		return dataMap, dataMapTime, nil
 	}
-	for index < len(data) && data[index] != 0xFF {
-		firstByte := data[index]
-		index += 1
-
-		switch firstByte {
-		case 0x00:
-			key, err := readString(data, &index)
-			if err != nil {
-				return dataMap, dataMapTime, nil
-			}
-			value, err := readString(data, &index)
-			if err != nil {
-				return dataMap, dataMapTime, nil
-			}
-			dataMap[key] = value
-			fmt.Printf("Loaded key: '%s', value: '%s'\n", key, value)
-
-		case 0xFD:
-			if index+4 > len(data) {
-				return dataMap, dataMapTime, fmt.Errorf("expected more bytes for expiration")
-			}
-			expirationSeconds := binary.LittleEndian.Uint32(data[index : index+4])
-			index += 4
-			if data[index] != 0x00 {
-				return dataMap, dataMapTime, fmt.Errorf("Expected string after expiration")
-			}
-			index++
-			key, err := readString(data, &index)
-			if err != nil {
-				return dataMap, dataMapTime, nil
-			}
-			value, err := readString(data, &index)
-			if err != nil {
-				return dataMap, dataMapTime, nil
-			}
-
-			dataMap[key] = value
-			fmt.Printf("Loaded key: '%s', value: '%s'\n", key, value)
-
-			dataMapTime[key] = time.Unix(int64(expirationSeconds), 0)
-
-		case 0xFB: //FB starts with size of the hash table that stores the keys and values
-			if index+4 > len(data) { //idk
-				return dataMap, dataMapTime, fmt.Errorf("undexpected end after after 0xFB")
-			}
-			_ = binary.LittleEndian.Uint32(data[index : index+4])
-			index += 4
-			key, err := readString(data, &index)
-			if err != nil {
-				return dataMap, dataMapTime, nil
-			}
-			value, err := readString(data, &index)
-			if err != nil {
-				return dataMap, dataMapTime, nil
-			}
-			dataMap[key] = value
-			fmt.Printf("Loaded key: '%s', value: '%s'\n", key, value)
-
-		default:
-			return dataMap, dataMapTime, fmt.Errorf("unsupported entry type: 0x%X at index %d", firstByte, index-1)
-		}
+	value, err := readString(data, &index)
+	if err != nil {
+		return dataMap, dataMapTime, nil
 	}
-	//debugging
-	fmt.Printf("readRDB parsed %d keys: \n:", len(dataMap))
-	for k, v := range dataMap {
-		fmt.Printf("→ %s = %s\n", k, v)
-	}
+	dataMap[key] = value
+	fmt.Print("Loaded key: '%s', value: '%s'\n", key, value)
 	return dataMap, dataMapTime, nil
+
 }
 
 func readString(data []byte, index *int) (string, error) {
