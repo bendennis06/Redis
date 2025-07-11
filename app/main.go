@@ -178,10 +178,7 @@ func readRDB(filePath string) (map[string]string, map[string]time.Time, error) {
 	dataMap := make(map[string]string)
 	dataMapTime := make(map[string]time.Time)
 
-	//check: do we start with "REDIS" and version 0011? else abort
 	data, err := os.ReadFile(filePath)
-	//dataLength := len(data)
-	//results := []string{}
 	fmt.Println(data)
 	fmt.Println(string(data))
 
@@ -191,7 +188,6 @@ func readRDB(filePath string) (map[string]string, map[string]time.Time, error) {
 	if len(data) < 9 {
 		return dataMap, dataMapTime, nil
 	}
-
 	//fmt.Println("Magic:", string(data[:9])) //debug
 	if string(data[:9]) != "REDIS0011" {
 		return dataMap, dataMapTime, nil
@@ -199,25 +195,26 @@ func readRDB(filePath string) (map[string]string, map[string]time.Time, error) {
 
 	index := 9
 
-	for index < len(data) && data[index] != 0xFB {
-		index++
-
+	for index < len(data) && data[index] != 0xFB { //get to FB
+		index++ //past following byte
 	}
-	fmt.Printf("we here → index=%d, byte=0x%X\n", index, data[index]) // at 0xFB
 	index += 4
+	fmt.Printf("we here → index=%d, byte=0x%X\n", index, data[index]) // at 0xFB
+	for index < len(data) && data[index] != 0xFF {
 
-	key, err := readString(data, &index)
-	if err != nil {
-		return dataMap, dataMapTime, nil
+		key, err := readString(data, &index)
+		if err != nil {
+			return dataMap, dataMapTime, nil
+		}
+		value, err := readString(data, &index)
+		if err != nil {
+			return dataMap, dataMapTime, nil
+		}
+		dataMap[key] = value
+		fmt.Print("Loaded key: '%s', value: '%s'\n", key, value)
+		index++
 	}
-	value, err := readString(data, &index)
-	if err != nil {
-		return dataMap, dataMapTime, nil
-	}
-	dataMap[key] = value
-	fmt.Print("Loaded key: '%s', value: '%s'\n", key, value)
 	return dataMap, dataMapTime, nil
-
 }
 
 func readString(data []byte, index *int) (string, error) {
