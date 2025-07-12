@@ -168,53 +168,134 @@ func Get(commands []string, dataMap map[string]string, expiryMap map[string]time
 
 	value, ok := dataMap[key]
 	if !ok {
-		return "$-1\r\n" //null bulk string
+		return "$-1\r\n"
 	}
+
 	return fmt.Sprintf("$%d\r\n%s\r\n", len(value), value) //format
 }
 
 // return keys value from file and key with their expiration time
 func readRDB(filePath string) (map[string]string, map[string]time.Time, error) {
 	dataMap := make(map[string]string)
-	dataMapTime := make(map[string]time.Time)
+	expiryMap := make(map[string]time.Time)
 
 	data, err := os.ReadFile(filePath)
 	fmt.Println(data)
 	fmt.Println(string(data))
 
 	if err != nil {
-		return dataMap, dataMapTime, nil
+		return dataMap, expiryMap, nil
 	}
 	if len(data) < 9 {
-		return dataMap, dataMapTime, nil
+		return dataMap, expiryMap, nil
 	}
 	//fmt.Println("Magic:", string(data[:9])) //debug
 	if string(data[:9]) != "REDIS0011" {
-		return dataMap, dataMapTime, nil
+		return dataMap, expiryMap, nil
 	}
 
 	index := 9
 
-	for index < len(data) && data[index] != 0xFB { //get to FB
-		index++ //past following byte
-	}
-	index += 4
-	fmt.Printf("we here → index=%d, byte=0x%X\n", index, data[index]) // at 0xFB
-	for index < len(data) && data[index] != 0xFF {
-
-		key, err := readString(data, &index)
-		if err != nil {
-			return dataMap, dataMapTime, nil
-		}
-		value, err := readString(data, &index)
-		if err != nil {
-			return dataMap, dataMapTime, nil
-		}
-		dataMap[key] = value
-		fmt.Print("Loaded key: '%s', value: '%s'\n", key, value)
+	for index < len(data) && data[index] != 0xFB { //get to FB (251)
 		index++
 	}
-	return dataMap, dataMapTime, nil
+	for index < len(data) && data[index] != 0xFF {
+		entryType := data[index]
+		index++
+		switch entryType {
+		case 0xFC:
+			fmt.Println("entered FC")
+			expirationInMs := binary.LittleEndian.Uint64(data[index : index+8])
+			index += 8
+
+			key, err := readString(data, &index)
+			if err != nil {
+				return dataMap, expiryMap, nil
+			}
+			value, err := readString(data, &index)
+			if err != nil {
+				return dataMap, expiryMap, nil
+			}
+
+			expiry := time.Unix(0, int64(expirationInMs)*int64(time.Millisecond))
+			fmt.Printf("expiration converted: %v\n", expiry)
+			dataMap[key] = value
+			expiryMap[key] = expiry
+			fmt.Printf("Loaded key: '%s', value: '%s'\n", key, value)
+
+		}
+	}
+
+	fmt.Println("Final dataMap contents:")
+	for k, v := range dataMap {
+		fmt.Printf("→ Key: %q | Value: %q\n", k, v)
+	}
+
+	fmt.Println("Expiration times:")
+	for k, t := range expiryMap {
+		fmt.Printf("→ Key: %q | Expires at: %s\n", k, t)
+	}
+
+	//fmt.Printf("FB index %d\n", index) //FB index correct
+	//index += 2                         // skip past 2 bit flags
+	//fmt.Printf("Now at %d\n", index)
+	//entryType := data[index]
+	//index++
+	//
+	//switch entryType {
+	//case 0xFB:
+	//	//index++ //test
+	//	fmt.Println("entered case FB")
+	//	key, err := readString(data, &index)
+	//	if err != nil {
+	//		return dataMap, expiryMap, nil
+	//	}
+	//	value, err := readString(data, &index)
+	//	if err != nil {
+	//		return dataMap, expiryMap, nil
+	//	}
+	//	dataMap[key] = value
+	//	fmt.Printf("Loaded key: '%s', value: '%s'\n", key, value)
+	//	//index++
+	//
+	//case 0xFC:
+	//	//	index++ //test
+	//	fmt.Printf("Found FC at index=%d\n", index)
+	//	index++
+	//	//fmt.Println("entered case FC")
+	//	expirationInMs := binary.LittleEndian.Uint64(data[index-1 : index+7])
+	//	//fmt.Printf("raw expiration bytes: %v\n", data[index:index+8])
+	//	//fmt.Printf("expiration time: %d\n", expirationInMs)
+	//
+	//	index += 8
+	//
+	//	key, err := readString(data, &index)
+	//	if err != nil {
+	//		return dataMap, expiryMap, nil
+	//	}
+	//	value, err := readString(data, &index)
+	//	if err != nil {
+	//		return dataMap, expiryMap, nil
+	//	}
+	//	expiry := time.Unix(0, int64(expirationInMs)*int64(time.Millisecond))
+	//	//fmt.Printf("expiration converted: %v\n", expiry)
+	//	dataMap[key] = value
+	//	expiryMap[key] = expiry
+	//	fmt.Printf("Loaded key: '%s', value: '%s'\n", key, value)
+	//}
+
+	//}
+	//fmt.Println("Final dataMap contents:")
+	//for k, v := range dataMap {
+	//	fmt.Printf("→ Key: %q | Value: %q\n", k, v)
+	//}
+	//
+	//fmt.Println("Expiration times:")
+	//for k, t := range expiryMap {
+	//	fmt.Printf("→ Key: %q | Expires at: %s\n", k, t)
+	//}
+	//
+	return dataMap, expiryMap, nil
 }
 
 func readString(data []byte, index *int) (string, error) {
