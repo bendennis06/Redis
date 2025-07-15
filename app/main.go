@@ -161,6 +161,9 @@ func Get(commands []string, dataMap map[string]string, expiryMap map[string]time
 	key := commands[1]
 
 	if expTime, ok := expiryMap[key]; ok && time.Now().After(expTime) {
+		//debug
+		fmt.Printf("[debug] key: %s | expires at: %v | now: %v\n", key, expTime, time.Now())
+
 		delete(dataMap, key) //delete entries in maps
 		delete(expiryMap, key)
 		return "$-1\r\n"
@@ -181,33 +184,49 @@ func readRDB(filePath string) (map[string]string, map[string]time.Time, error) {
 
 	data, err := os.ReadFile(filePath)
 	fmt.Println(data)
-	fmt.Println(string(data))
+	//fmt.Println(string(data))
 
-	if err != nil {
-		return dataMap, expiryMap, nil
-	}
-	if len(data) < 9 {
-		return dataMap, expiryMap, nil
-	}
-	//fmt.Println("Magic:", string(data[:9])) //debug
-	if string(data[:9]) != "REDIS0011" {
+	if err != nil || string(data[:9]) != "REDIS0011" || len(data) < 9 {
 		return dataMap, expiryMap, nil
 	}
 
 	index := 9
 
-	for index < len(data) && data[index] != 0xFB { //get to FB (251)
-		index++
-	}
 	for index < len(data) && data[index] != 0xFF {
 		entryType := data[index]
-		index++
+
 		switch entryType {
-		case 0xFC:
-			fmt.Println("entered FC")
+		case 0xFA: // AUX — skip key and value
+			index++
+			_, err := readString(data, &index)
+			if err != nil {
+				return dataMap, expiryMap, err
+			}
+			_, err = readString(data, &index)
+			if err != nil {
+				return dataMap, expiryMap, err
+			}
+		case 0xFB:
+			index += 2
+		case 0xFC: //252
+			index++ //keys and vals work with this, timestamp works without
+			if index+8 > len(data) {
+				return dataMap, expiryMap, fmt.Errorf("bad expiration")
+			}
+
 			expirationInMs := binary.LittleEndian.Uint64(data[index : index+8])
 			index += 8
 
+			entryType = data[index]
+			index++
+
+			if entryType != 0x00 {
+				return dataMap, expiryMap, fmt.Errorf("Wrong entry type %x", entryType)
+			}
+
+			fmt.Printf("Next bytes before reading key: %v\n", data[index:index+8])
+
+			fmt.Printf("byte at index before readString: %02x\n", data[index])
 			key, err := readString(data, &index)
 			if err != nil {
 				return dataMap, expiryMap, nil
@@ -218,11 +237,26 @@ func readRDB(filePath string) (map[string]string, map[string]time.Time, error) {
 			}
 
 			expiry := time.Unix(0, int64(expirationInMs)*int64(time.Millisecond))
+			//expiry = expiry.AddDate(56, 0, 0)
 			fmt.Printf("expiration converted: %v\n", expiry)
 			dataMap[key] = value
 			expiryMap[key] = expiry
-			fmt.Printf("Loaded key: '%s', value: '%s'\n", key, value)
 
+		case 0x00:
+			index++
+
+			key, err := readString(data, &index)
+			if err != nil {
+				return dataMap, expiryMap, nil
+			}
+			value, err := readString(data, &index)
+			if err != nil {
+				return dataMap, expiryMap, nil
+			}
+			dataMap[key] = value
+
+		default:
+			return dataMap, expiryMap, fmt.Errorf("unknown entryType: %x at index %d", entryType, index)
 		}
 	}
 
@@ -236,105 +270,51 @@ func readRDB(filePath string) (map[string]string, map[string]time.Time, error) {
 		fmt.Printf("→ Key: %q | Expires at: %s\n", k, t)
 	}
 
-	//fmt.Printf("FB index %d\n", index) //FB index correct
-	//index += 2                         // skip past 2 bit flags
-	//fmt.Printf("Now at %d\n", index)
-	//entryType := data[index]
-	//index++
-	//
-	//switch entryType {
-	//case 0xFB:
-	//	//index++ //test
-	//	fmt.Println("entered case FB")
-	//	key, err := readString(data, &index)
-	//	if err != nil {
-	//		return dataMap, expiryMap, nil
-	//	}
-	//	value, err := readString(data, &index)
-	//	if err != nil {
-	//		return dataMap, expiryMap, nil
-	//	}
-	//	dataMap[key] = value
-	//	fmt.Printf("Loaded key: '%s', value: '%s'\n", key, value)
-	//	//index++
-	//
-	//case 0xFC:
-	//	//	index++ //test
-	//	fmt.Printf("Found FC at index=%d\n", index)
-	//	index++
-	//	//fmt.Println("entered case FC")
-	//	expirationInMs := binary.LittleEndian.Uint64(data[index-1 : index+7])
-	//	//fmt.Printf("raw expiration bytes: %v\n", data[index:index+8])
-	//	//fmt.Printf("expiration time: %d\n", expirationInMs)
-	//
-	//	index += 8
-	//
-	//	key, err := readString(data, &index)
-	//	if err != nil {
-	//		return dataMap, expiryMap, nil
-	//	}
-	//	value, err := readString(data, &index)
-	//	if err != nil {
-	//		return dataMap, expiryMap, nil
-	//	}
-	//	expiry := time.Unix(0, int64(expirationInMs)*int64(time.Millisecond))
-	//	//fmt.Printf("expiration converted: %v\n", expiry)
-	//	dataMap[key] = value
-	//	expiryMap[key] = expiry
-	//	fmt.Printf("Loaded key: '%s', value: '%s'\n", key, value)
-	//}
-
-	//}
-	//fmt.Println("Final dataMap contents:")
-	//for k, v := range dataMap {
-	//	fmt.Printf("→ Key: %q | Value: %q\n", k, v)
-	//}
-	//
-	//fmt.Println("Expiration times:")
-	//for k, t := range expiryMap {
-	//	fmt.Printf("→ Key: %q | Expires at: %s\n", k, t)
-	//}
-	//
 	return dataMap, expiryMap, nil
 }
 
 func readString(data []byte, index *int) (string, error) {
-	firstByte := data[*index]
-	*index += 1
+	//if *index >= len(data) {
+	//	return "", fmt.Errorf("index error out of bounds")
+	//}
+	//
+	//length := int(data[*index])
+	//*index += 1
+	//fmt.Printf("length is: %d", length)
+	//if *index+length > len(data) {
+	//	return "", fmt.Errorf("not enough data to read string of length %d", length)
+	//}
+	//
+	//str := string(data[*index : *index+length])
+	//*index += length
 
-	prefix := firstByte & 0xC0 //mask the first two bits
-	var length int
-	var str string
+	//prefix := firstByte & 0xC0 //mask the first two bits
+	//var length int
+	//var str string
 
-	switch prefix {
-
-	case 0x00: //6 bit
-		length = int(firstByte & 0x3F)
-
-	case 0x40: //14 bit
-		if *index >= len(data) {
-			return "", fmt.Errorf("Error end of data(14 bit)")
-		}
-		secondByte := data[*index]
-		*index += 1
-		length = int(firstByte&0x3f)<<8 | int(secondByte)
-
-	case 0x80: // 32 bit
-		if *index+4 > len(data) {
-			return "", fmt.Errorf("not enough bytes")
-		}
-		length = int(binary.BigEndian.Uint32(data[*index : *index+4]))
-		*index += 4
-
-	case 0xC0: //special case
-		return "", fmt.Errorf("unsupported string encoding")
-	}
-
-	if *index+length > len(data) {
-		return "", fmt.Errorf("not enough data to read string of %d", length)
-	}
-	str = string(data[*index : *index+length])
-	*index += length
+	//switch prefix {
+	//
+	//case 0x00: //6 bit
+	//	length = int(firstByte & 0x3F)
+	//
+	//case 0x40: //14 bit
+	//	if *index >= len(data) {
+	//		return "", fmt.Errorf("Error end of data(14 bit)")
+	//	}
+	//	secondByte := data[*index]
+	//	*index += 1
+	//	length = int(firstByte&0x3f)<<8 | int(secondByte)
+	//
+	//case 0x80: // 32 bit
+	//	if *index+4 > len(data) {
+	//		return "", fmt.Errorf("not enough bytes")
+	//	}
+	//	length = int(binary.BigEndian.Uint32(data[*index : *index+4]))
+	//	*index += 4
+	//
+	//case 0xC0: //special case
+	//	return "", fmt.Errorf("unsupported string encoding")
+	//}
 	return str, nil
 }
 
