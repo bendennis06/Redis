@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -13,309 +15,333 @@ import (
 	"time"
 )
 
-// expect a --dir argument and store in dir variable
+type StoreValue struct {
+	value  string
+	expiry *time.Time
+}
+
+var Store = make(map[string]StoreValue)
+
+var cache map[string]bool
+
 var dir = flag.String("dir", "", "Directory where RDB file is stored")
 var dbfilename = flag.String("dbfilename", "", "Name of the RDB file")
 
-// Take the raw bytes (or string) your server reads from the connection.
-// Parse the Redis RESP protocol.
-// Return a slice []string → the command name and its arguments.
-// //ex *2\r\n$5\r\nhello\r\n$5\r\nworld\r\n
-func parseRESP(b []byte) ([]string, error) {
-
-	if len(b) == 0 {
-		return nil, fmt.Errorf("input to short") //no data to read
-	}
-
-	if b[0] != '*' {
-		return nil, fmt.Errorf("expected array at top level") //needs to start with '*'
-	}
-
-	index := 1
-	//look for '\r\n'
-	for index < len(b) && !(b[index] == '\r' && b[index+1] == '\n') {
-		index++
-	}
-
-	arraySizeString := string(b[1:index])            //string slice, grab array length
-	arrSizeInt, err := strconv.Atoi(arraySizeString) //convert string to int
-	if err != nil {
-		return nil, fmt.Errorf("not valid array size", err)
-	}
-
-	index += 2 //skip past '\r\n
-
-	parts := []string{}               //[] slice(dynamic array) that holds strings, {} ini as empty
-	for j := 0; j < arrSizeInt; j++ { //runs for each num of strings (*n) will run n times
-		if b[index] != '$' {
-			return nil, fmt.Errorf("expected bulk string", b[index]) //look for '$' (bulk strings)
-		}
-		index++
-
-		startInt := index //start of string
-		for index < len(b) && !(b[index] == '\r' && b[index+1] == '\n') {
-			index++
-		}
-		bulkLenStr := string(b[startInt:index])  //length of string (num after $)
-		bulkLen, err := strconv.Atoi(bulkLenStr) //convert length to int
-		if err != nil {
-			return nil, fmt.Errorf("bad bulk length", err)
-		}
-		index += 2                               //skip past '\r\n'
-		part := string(b[index : index+bulkLen]) //extract bulk string
-		parts = append(parts, part)
-
-		index += bulkLen + 2 //move past string and last \r\n
-	}
-	return parts, nil
-}
-
-func handleConnection(conn net.Conn, dataMap map[string]string, expiryMap map[string]time.Time) {
+func handleConnection(conn net.Conn, dir string, dbfilename string) {
 	defer conn.Close()
-	buffer := make([]byte, 1024)
-
-	configCom := map[string]string{ //config command; store string vals here
-		"dir":        *dir,
-		"dbfilename": *dbfilename,
-	}
+	reader := bufio.NewReader(conn)
 
 	//maybe use a switch?
 	for {
-		n, err := conn.Read(buffer)
+		line, err := parseRESP(reader)
 		if err != nil {
+			fmt.Println("error reading from connection ", err)
+		}
+		if len(line) == 0 { //test
 			return
 		}
-
 		//parse resp
-		commands, err := parseRESP(buffer[:n])
-		if err != nil {
-			fmt.Println("error parsing", err)
-			continue
-		}
+		command := strings.ToUpper(line[0])
+		switch command {
 
-		//check command is ping
-		if len(commands) == 1 && strings.ToUpper(commands[0]) == "PING" {
+		case "ECHO":
+			conn.Write(fmt.Appendf(nil, "$%d\r\n%s\r\n", len(line[1]), line[1]))
+		case "PING":
 			conn.Write([]byte("+PONG\r\n"))
-		}
-		//check if command is echo
-		if len(commands) == 2 && strings.ToUpper(commands[0]) == "ECHO" {
-			response := fmt.Sprintf("$%d\r\n%s\r\n", len(commands[1]), commands[1]) //build a formatted string
-			conn.Write([]byte(response))                                            // return formatted string
-		}
-
-		if strings.ToUpper(commands[0]) == "SET" {
-			response := Set(commands, dataMap, expiryMap)
-			conn.Write([]byte(response))
-		}
-
-		if strings.ToUpper(commands[0]) == "GET" {
-			response := Get(commands, dataMap, expiryMap)
-			conn.Write([]byte(response))
-		}
-
-		if strings.ToUpper(commands[0]) == "CONFIG" && strings.ToUpper(commands[1]) == "GET" && len(commands) == 3 {
-			parameter := commands[2]
-			value, ok := configCom[parameter]
-			if !ok {
+		case "SET":
+			if len(line) > 3 && strings.ToUpper(line[3]) == "PX" {
+				px, err := strconv.Atoi(line[4])
+				if err != nil {
+					fmt.Println("expiry should be int")
+					continue
+				}
+				expiry := time.Now().Add(time.Millisecond * time.Duration(px))
+				Store[line[1]] = StoreValue{line[2], &expiry}
+			} else {
+				Store[line[1]] = StoreValue{line[2], nil}
+			}
+			conn.Write([]byte("+OK\r\n"))
+		case "GET":
+			val, ok := Store[line[1]]
+			if !ok || (val.expiry != nil) && time.Now().After(*val.expiry) {
 				conn.Write([]byte("$-1\r\n"))
-				continue
+			} else {
+				conn.Write(fmt.Appendf(nil, "$%d\r\n%s\r\n", len(val.value), val.value))
 			}
-			response := fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(parameter), parameter, len(value), value)
-			conn.Write([]byte(response))
-		}
-		if strings.ToUpper(commands[0]) == "KEYS" && commands[1] == "*" {
-			response := fmt.Sprintf("*%d\r\n", len(dataMap)) //sprintf returns formatted string
-			for key := range dataMap {
-				response += fmt.Sprintf("$%d\r\n%s\r\n", len(key), key)
+		case "CONFIG":
+			if line[2] == "dir" {
+				conn.Write(fmt.Appendf(nil, "*2\r\n$3\r\ndir\r\n$%d\r\n%s\r\n", len(dir), dir))
+			} else if line[2] == "dbfilename" {
+				conn.Write(fmt.Appendf(nil, "*2\r\n$10\r\ndbfilename\r\n$%d\r\n%s\r\n", len(dbfilename), dbfilename))
 			}
-			conn.Write([]byte(response))
+		case "KEYS":
+			conn.Write([]byte(outputRESP(FindKeys(line[1]))))
+
 		}
 	}
 }
 
-func Set(commands []string, dataMap map[string]string, expiryMap map[string]time.Time) string {
-	//ex set name ben
-	if len(commands) != 3 && len(commands) != 5 {
-		return "Error, wrong length for set command"
+func FindKeys(pattern string) []string {
+	output := []string{}
+	for key := range Store {
+		cache = make(map[string]bool)
+		if matchString(pattern, key, 0, 0) {
+			output = append(output, key)
+		}
 	}
-	key := commands[1]
-	value := commands[2]
-	dataMap[key] = value
+	return output
+}
 
-	if len(commands) == 5 && strings.ToUpper(commands[3]) == "PX" {
-		milliStr := commands[4]
-		milliSec, err := strconv.Atoi(milliStr) //covert time to an int
+func matchString(pattern, word string, i, j int) bool {
+	if i >= len(pattern) {
+		return j >= len(word)
+	}
+
+	if j >= len(word) {
+		for i < len(pattern) && pattern[i] == '*' {
+			i++
+		}
+		return i == len(pattern)
+	}
+	key := strconv.Itoa(i) + ", " + strconv.Itoa(j)
+	val, ok := cache[key]
+	if ok {
+		return val
+	}
+	if pattern[i] == word[j] {
+		cache[key] = matchString(pattern, word, i+1, j+1)
+	} else if pattern[i] == '*' {
+		cache[key] = matchString(pattern, word, i+1, j) || matchString(pattern, word, i, j+1)
+	} else {
+		cache[key] = false
+	}
+	return cache[key]
+}
+
+func parseRESP(r *bufio.Reader) ([]string, error) {
+	prefix, err := r.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+	if prefix != '*' {
+		return nil, err
+	}
+
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return nil, err
+	}
+	line = strings.TrimSpace(line)
+	count, err := strconv.Atoi(line)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		prefix, err := r.ReadByte()
 		if err != nil {
-			return "ERROR: px value must be an int"
+			return nil, err
 		}
-		expiryMap[key] = time.Now().Add(time.Duration(milliSec) * time.Millisecond) //covert time conversion to seconds relative to current time and store in new map
+		if prefix != '$' {
+			return nil, fmt.Errorf("expected $")
+		}
+		lengthLine, err := r.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		lengthLine = strings.TrimSpace(lengthLine)
+		length, err := strconv.Atoi(lengthLine)
+		if err != nil {
+			return nil, fmt.Errorf("invalid bulk string length ", err)
+		}
+		buf := make([]byte, length)
+		_, err = r.Read(buf)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := r.ReadByte(); err != nil {
+			return nil, err
+		}
+		if _, err := r.ReadByte(); err != nil {
+			return nil, err
+		}
+		result = append(result, string(buf))
 	}
-	return "+OK\r\n"
+	return result, nil
 }
 
-func Get(commands []string, dataMap map[string]string, expiryMap map[string]time.Time) string {
-	//ex get name
-	if len(commands) != 2 {
-		return "ERROR: wrong length for get command"
+func outputRESP(items []string) string {
+	var b strings.Builder
+	// Write the array header: *<num items>
+	b.WriteString(fmt.Sprintf("*%d\r\n", len(items)))
+	for _, item := range items {
+		// Each item is a bulk string: $<length>\r\n<item>\r\n
+		b.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(item), item))
 	}
-	key := commands[1]
+	return b.String()
+}
 
-	if expTime, ok := expiryMap[key]; ok && time.Now().After(expTime) {
-		//debug
-		fmt.Printf("[debug] key: %s | expires at: %v | now: %v\n", key, expTime, time.Now())
+//func Set(commands []string, dataMap map[string]string, expiryMap map[string]time.Time) string {
+//	//ex set name ben
+//	if len(commands) != 3 && len(commands) != 5 {
+//		return "Error, wrong length for set command"
+//	}
+//	key := commands[1]
+//	value := commands[2]
+//	dataMap[key] = value
+//
+//	if len(commands) == 5 && strings.ToUpper(commands[3]) == "PX" {
+//		milliStr := commands[4]
+//		milliSec, err := strconv.Atoi(milliStr) //covert time to an int
+//		if err != nil {
+//			return "ERROR: px value must be an int"
+//		}
+//		expiryMap[key] = time.Now().Add(time.Duration(milliSec) * time.Millisecond) //covert time conversion to seconds relative to current time and Store in new map
+//	}
+//	return "+OK\r\n"
+//}
+//
+//func Get(commands []string, dataMap map[string]string, expiryMap map[string]time.Time) string {
+//	//ex get name
+//	if len(commands) != 2 {
+//		return "ERROR: wrong length for get command"
+//	}
+//	key := commands[1]
+//
+//	if expTime, ok := expiryMap[key]; ok && time.Now().After(expTime) {
+//		//debug
+//		fmt.Printf("[debug] key: %s | expires at: %v | now: %v\n", key, expTime, time.Now())
+//
+//		delete(dataMap, key) //delete entries in maps
+//		delete(expiryMap, key)
+//		return "$-1\r\n"
+//	}
+//
+//	value, ok := dataMap[key]
+//	if !ok {
+//		return "$-1\r\n"
+//	}
+//	return fmt.Sprintf("$%d\r\n%s\r\n", len(value), value) //format
+//}
 
-		delete(dataMap, key) //delete entries in maps
-		delete(expiryMap, key)
-		return "$-1\r\n"
+func readString(b *bytes.Reader) (string, error) {
+	length, err, asInt := readLength(b)
+	if err != nil {
+		return "", err
+	}
+	buf := make([]byte, length)
+	binary.Read(b, binary.BigEndian, &buf)
+	if asInt {
+		return strconv.Itoa(length), nil
+	}
+	return string(buf), nil
+}
+
+// decode and read the length
+func readLength(b *bytes.Reader) (length int, err error, asInt bool) {
+	prefix, err := b.ReadByte()
+	if err != nil {
+		return 0, err, false
 	}
 
-	value, ok := dataMap[key]
-	if !ok {
-		return "$-1\r\n"
-	}
+	switch prefix >> 6 {
+	case 0x00:
+		return int(prefix & 0x3F), nil, false
 
-	return fmt.Sprintf("$%d\r\n%s\r\n", len(value), value) //format
+	case 0x01:
+		next, _ := b.ReadByte()
+		return int(uint16(prefix&0x3F)<<8 | uint16(next)), nil, false
+
+	case 0x02:
+		var l uint32
+		binary.Read(b, binary.BigEndian, &l)
+		return int(l), nil, true
+
+	case 0x03:
+		switch prefix {
+		case 0xC0:
+			var l uint8
+			binary.Read(b, binary.BigEndian, &l)
+			return int(l), nil, true
+
+		case 0xC1:
+			var l uint16
+			binary.Read(b, binary.BigEndian, &l)
+			return int(l), nil, true
+
+		case 0xC2:
+			var l uint32
+			binary.Read(b, binary.BigEndian, &l)
+			return int(l), nil, true
+		default:
+			return int(prefix), nil, false
+		}
+	default:
+		return 0, fmt.Errorf("unsupported length encoding"), false
+	}
 }
 
 // return keys value from file and key with their expiration time
-func readRDB(filePath string) (map[string]string, map[string]time.Time, error) {
-	dataMap := make(map[string]string)
-	expiryMap := make(map[string]time.Time)
-
+func readRDBintoStore(filePath string) error {
 	data, err := os.ReadFile(filePath)
-	fmt.Println(data)
-	//fmt.Println(string(data))
-
-	if err != nil || string(data[:9]) != "REDIS0011" || len(data) < 9 {
-		return dataMap, expiryMap, nil
+	if err != nil {
+		return err
 	}
+	fmt.Println(data)
 
-	index := 9
+	r := bytes.NewReader(data)
+	fbFlag := false
+	expiry := time.Time{}
 
-	for index < len(data) && data[index] != 0xFF {
-		entryType := data[index]
+	for {
+		op, err := r.ReadByte()
+		if err != nil {
+			break
+		}
 
-		switch entryType {
-		case 0xFA: // AUX — skip key and value
-			index++
-			_, err := readString(data, &index)
-			if err != nil {
-				return dataMap, expiryMap, err
-			}
-			_, err = readString(data, &index)
-			if err != nil {
-				return dataMap, expiryMap, err
-			}
+		if op == 0xFB {
+			fbFlag = true
+		}
+		if !fbFlag {
+			continue
+		}
+
+		switch op {
+
 		case 0xFB:
-			index += 2
-		case 0xFC: //252
-			index++ //keys and vals work with this, timestamp works without
-			if index+8 > len(data) {
-				return dataMap, expiryMap, fmt.Errorf("bad expiration")
-			}
-
-			expirationInMs := binary.LittleEndian.Uint64(data[index : index+8])
-			index += 8
-
-			entryType = data[index]
-			index++
-
-			if entryType != 0x00 {
-				return dataMap, expiryMap, fmt.Errorf("Wrong entry type %x", entryType)
-			}
-
-			fmt.Printf("Next bytes before reading key: %v\n", data[index:index+8])
-
-			fmt.Printf("byte at index before readString: %02x\n", data[index])
-			key, err := readString(data, &index)
-			if err != nil {
-				return dataMap, expiryMap, nil
-			}
-			value, err := readString(data, &index)
-			if err != nil {
-				return dataMap, expiryMap, nil
-			}
-
-			expiry := time.Unix(0, int64(expirationInMs)*int64(time.Millisecond))
-			//expiry = expiry.AddDate(56, 0, 0)
-			fmt.Printf("expiration converted: %v\n", expiry)
-			dataMap[key] = value
-			expiryMap[key] = expiry
-
+			readLength(r)
+			readLength(r)
+		case 0xFD: //read 4 bytes, seconds expiration
+			var expirySeconds uint32
+			binary.Read(r, binary.LittleEndian, &expirySeconds)
+			expiry = time.Unix(int64(expirySeconds), 0)
+		case 0xFC: //read 8 bytes, milliseconds expiration
+			var expiryMiliSec uint64
+			binary.Read(r, binary.LittleEndian, &expiryMiliSec)
+			expiry = time.Unix(0, int64(expiryMiliSec)*1_000_000)
 		case 0x00:
-			index++
-
-			key, err := readString(data, &index)
+			key, err := readString(r)
 			if err != nil {
-				return dataMap, expiryMap, nil
+				fmt.Println("bad Key")
 			}
-			value, err := readString(data, &index)
-			if err != nil {
-				return dataMap, expiryMap, nil
-			}
-			dataMap[key] = value
 
-		default:
-			return dataMap, expiryMap, fmt.Errorf("unknown entryType: %x at index %d", entryType, index)
+			val, err := readString(r)
+			if err != nil {
+				fmt.Println("bad value")
+			}
+			if expiry.IsZero() {
+				Store[key] = StoreValue{value: val, expiry: nil}
+			} else {
+				valToSave := expiry
+				Store[key] = StoreValue{value: val, expiry: &valToSave}
+			}
+			expiry = time.Time{}
+		case 0xFF:
+			return nil
 		}
 	}
-
-	fmt.Println("Final dataMap contents:")
-	for k, v := range dataMap {
-		fmt.Printf("→ Key: %q | Value: %q\n", k, v)
-	}
-
-	fmt.Println("Expiration times:")
-	for k, t := range expiryMap {
-		fmt.Printf("→ Key: %q | Expires at: %s\n", k, t)
-	}
-
-	return dataMap, expiryMap, nil
-}
-
-func readString(data []byte, index *int) (string, error) {
-	//if *index >= len(data) {
-	//	return "", fmt.Errorf("index error out of bounds")
-	//}
-	//
-	//length := int(data[*index])
-	//*index += 1
-	//fmt.Printf("length is: %d", length)
-	//if *index+length > len(data) {
-	//	return "", fmt.Errorf("not enough data to read string of length %d", length)
-	//}
-	//
-	//str := string(data[*index : *index+length])
-	//*index += length
-
-	//prefix := firstByte & 0xC0 //mask the first two bits
-	//var length int
-	//var str string
-
-	//switch prefix {
-	//
-	//case 0x00: //6 bit
-	//	length = int(firstByte & 0x3F)
-	//
-	//case 0x40: //14 bit
-	//	if *index >= len(data) {
-	//		return "", fmt.Errorf("Error end of data(14 bit)")
-	//	}
-	//	secondByte := data[*index]
-	//	*index += 1
-	//	length = int(firstByte&0x3f)<<8 | int(secondByte)
-	//
-	//case 0x80: // 32 bit
-	//	if *index+4 > len(data) {
-	//		return "", fmt.Errorf("not enough bytes")
-	//	}
-	//	length = int(binary.BigEndian.Uint32(data[*index : *index+4]))
-	//	*index += 4
-	//
-	//case 0xC0: //special case
-	//	return "", fmt.Errorf("unsupported string encoding")
-	//}
-	return str, nil
+	return nil
 }
 
 // Ensures gofmt doesn't remove the "net" and "os" imports in stage 1 (feel free to remove this!)
@@ -323,16 +349,15 @@ var _ = net.Listen
 var _ = os.Exit
 
 func main() {
-	flag.Parse() //parse input for command vals(RDB)
+	flag.Parse()
 
 	filePath := path.Join(*dir, *dbfilename)
 
-	dataMapKeys, expiryMapKeys, err := readRDB(filePath)
+	err := readRDBintoStore(filePath)
 	if err != nil {
 		fmt.Println("failed to load RDB file")
 	}
 
-	// You can use print statements as follows for debugging, they'll be visible when running tests.
 	fmt.Println("Logs from your program will appear here!")
 
 	l, err := net.Listen("tcp", "0.0.0.0:6379")
@@ -343,12 +368,11 @@ func main() {
 	defer l.Close()
 
 	for {
-		conn, err := l.Accept() //go's short variable declaration := declares and assigns at the same time
+		conn, err := l.Accept()
 		if err != nil {
-			fmt.Println("Error accepting connection: ", err.Error())
+			fmt.Println("Error accepting connection:", err.Error())
 			continue
-			//os.Exit(1)
 		}
-		go handleConnection(conn, dataMapKeys, expiryMapKeys) //handles each connection in its own goroutine
+		go handleConnection(conn, *dir, *dbfilename)
 	}
 }
