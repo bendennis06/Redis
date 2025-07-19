@@ -24,9 +24,6 @@ var Store = make(map[string]StoreValue)
 
 var cache map[string]bool
 
-var dir = flag.String("dir", "", "Directory where RDB file is stored")
-var dbfilename = flag.String("dbfilename", "", "Name of the RDB file")
-
 func handleConnection(conn net.Conn, dir string, dbfilename string) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
@@ -182,49 +179,6 @@ func outputRESP(items []string) string {
 	return b.String()
 }
 
-//func Set(commands []string, dataMap map[string]string, expiryMap map[string]time.Time) string {
-//	//ex set name ben
-//	if len(commands) != 3 && len(commands) != 5 {
-//		return "Error, wrong length for set command"
-//	}
-//	key := commands[1]
-//	value := commands[2]
-//	dataMap[key] = value
-//
-//	if len(commands) == 5 && strings.ToUpper(commands[3]) == "PX" {
-//		milliStr := commands[4]
-//		milliSec, err := strconv.Atoi(milliStr) //covert time to an int
-//		if err != nil {
-//			return "ERROR: px value must be an int"
-//		}
-//		expiryMap[key] = time.Now().Add(time.Duration(milliSec) * time.Millisecond) //covert time conversion to seconds relative to current time and Store in new map
-//	}
-//	return "+OK\r\n"
-//}
-//
-//func Get(commands []string, dataMap map[string]string, expiryMap map[string]time.Time) string {
-//	//ex get name
-//	if len(commands) != 2 {
-//		return "ERROR: wrong length for get command"
-//	}
-//	key := commands[1]
-//
-//	if expTime, ok := expiryMap[key]; ok && time.Now().After(expTime) {
-//		//debug
-//		fmt.Printf("[debug] key: %s | expires at: %v | now: %v\n", key, expTime, time.Now())
-//
-//		delete(dataMap, key) //delete entries in maps
-//		delete(expiryMap, key)
-//		return "$-1\r\n"
-//	}
-//
-//	value, ok := dataMap[key]
-//	if !ok {
-//		return "$-1\r\n"
-//	}
-//	return fmt.Sprintf("$%d\r\n%s\r\n", len(value), value) //format
-//}
-
 func readString(b *bytes.Reader) (string, error) {
 	length, err, asInt := readLength(b)
 	if err != nil {
@@ -349,6 +303,10 @@ var _ = net.Listen
 var _ = os.Exit
 
 func main() {
+	var dir = flag.String("dir", "", "Directory where RDB file is stored")
+	var dbfilename = flag.String("dbfilename", "", "Name of the RDB file")
+	var port = flag.Int("port", 6379, "port to listen on")
+
 	flag.Parse()
 
 	filePath := path.Join(*dir, *dbfilename)
@@ -360,7 +318,7 @@ func main() {
 
 	fmt.Println("Logs from your program will appear here!")
 
-	l, err := net.Listen("tcp", "0.0.0.0:6379")
+	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", *port))
 	if err != nil {
 		fmt.Println("Failed to bind to port 6379")
 		os.Exit(1)
