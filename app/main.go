@@ -14,13 +14,22 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+type connection struct {
+	Conn      net.Conn
+	isReplica bool
+}
 
 type StoreValue struct {
 	value  string
 	expiry *time.Time
 }
+
+var replicaLock sync.Mutex
+var replicas []net.Conn
 
 var Store = make(map[string]StoreValue)
 
@@ -28,9 +37,13 @@ var cache map[string]bool
 
 var role = "master"
 
-func handleConnection(conn net.Conn, dir string, dbfilename string) {
-	defer conn.Close()
-	reader := bufio.NewReader(conn)
+func handleConnection(rawConn net.Conn, dir string, dbfilename string) {
+	defer rawConn.Close()
+	conn := &connection{
+		Conn:      rawConn,
+		isReplica: false,
+	}
+	reader := bufio.NewReader(conn.Conn)
 
 	for {
 		line, err := parseRESP(reader)
@@ -44,9 +57,9 @@ func handleConnection(conn net.Conn, dir string, dbfilename string) {
 		command := strings.ToUpper(line[0])
 		switch command {
 		case "ECHO":
-			conn.Write(fmt.Appendf(nil, "$%d\r\n%s\r\n", len(line[1]), line[1]))
+			conn.Conn.Write(fmt.Appendf(nil, "$%d\r\n%s\r\n", len(line[1]), line[1]))
 		case "PING":
-			conn.Write([]byte("+PONG\r\n"))
+			conn.Conn.Write([]byte("+PONG\r\n"))
 		case "SET":
 			if len(line) > 3 && strings.ToUpper(line[3]) == "PX" {
 				px, err := strconv.Atoi(line[4])
@@ -59,31 +72,55 @@ func handleConnection(conn net.Conn, dir string, dbfilename string) {
 			} else {
 				Store[line[1]] = StoreValue{line[2], nil}
 			}
-			conn.Write([]byte("+OK\r\n"))
+			conn.Conn.Write([]byte("+OK\r\n"))
+
+			if !conn.isReplica {
+				propogateToReplicas(line)
+			}
 		case "GET":
 			val, ok := Store[line[1]]
 			if !ok || (val.expiry != nil) && time.Now().After(*val.expiry) {
-				conn.Write([]byte("$-1\r\n"))
+				conn.Conn.Write([]byte("$-1\r\n"))
 			} else {
-				conn.Write(fmt.Appendf(nil, "$%d\r\n%s\r\n", len(val.value), val.value))
+				conn.Conn.Write(fmt.Appendf(nil, "$%d\r\n%s\r\n", len(val.value), val.value))
 			}
 		case "CONFIG":
 			if line[2] == "dir" {
-				conn.Write(fmt.Appendf(nil, "*2\r\n$3\r\ndir\r\n$%d\r\n%s\r\n", len(dir), dir))
+				conn.Conn.Write(fmt.Appendf(nil, "*2\r\n$3\r\ndir\r\n$%d\r\n%s\r\n", len(dir), dir))
 			} else if line[2] == "dbfilename" {
-				conn.Write(fmt.Appendf(nil, "*2\r\n$10\r\ndbfilename\r\n$%d\r\n%s\r\n", len(dbfilename), dbfilename))
+				conn.Conn.Write(fmt.Appendf(nil, "*2\r\n$10\r\ndbfilename\r\n$%d\r\n%s\r\n", len(dbfilename), dbfilename))
 			}
 		case "KEYS":
-			conn.Write([]byte(outputRESP(FindKeys(line[1]))))
+			conn.Conn.Write([]byte(outputRESP(FindKeys(line[1]))))
 		case "INFO":
-			handleInfo(conn, line[1:])
+			handleInfo(conn.Conn, line[1:])
 		case "REPLCONF":
-			conn.Write([]byte("+OK\r\n"))
+			conn.isReplica = true
+			conn.Conn.Write([]byte("+OK\r\n"))
 		case "PSYNC":
-			conn.Write([]byte("+FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0\r\n"))
+			conn.isReplica = true
+			conn.Conn.Write([]byte("+FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0\r\n"))
 			RDBcontent, _ := hex.DecodeString("524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2")
-			conn.Write([]byte(fmt.Sprintf("$%v\r\n%v", len(string(RDBcontent)), string(RDBcontent))))
+			conn.Conn.Write([]byte(fmt.Sprintf("$%v\r\n%v", len(string(RDBcontent)), string(RDBcontent))))
+
+			replicaLock.Lock()
+			replicas = append(replicas, conn.Conn)
+			replicaLock.Unlock()
 		}
+	}
+}
+
+func propogateToReplicas(command []string) {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("*%d\r\n", len(command)))
+	for _, part := range command {
+		b.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(part), part))
+	}
+	payload := b.String()
+	replicaLock.Lock()
+	defer replicaLock.Unlock()
+	for _, rep := range replicas {
+		rep.Write([]byte(payload))
 	}
 }
 
