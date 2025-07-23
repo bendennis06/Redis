@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	_ "go/types"
+	"io"
 	"net"
 	"os"
 	"path"
@@ -24,11 +26,12 @@ var Store = make(map[string]StoreValue)
 
 var cache map[string]bool
 
+var role = "master"
+
 func handleConnection(conn net.Conn, dir string, dbfilename string) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
 
-	//maybe use a switch?
 	for {
 		line, err := parseRESP(reader)
 		if err != nil {
@@ -40,7 +43,6 @@ func handleConnection(conn net.Conn, dir string, dbfilename string) {
 		//parse resp
 		command := strings.ToUpper(line[0])
 		switch command {
-
 		case "ECHO":
 			conn.Write(fmt.Appendf(nil, "$%d\r\n%s\r\n", len(line[1]), line[1]))
 		case "PING":
@@ -73,8 +75,29 @@ func handleConnection(conn net.Conn, dir string, dbfilename string) {
 			}
 		case "KEYS":
 			conn.Write([]byte(outputRESP(FindKeys(line[1]))))
-
+		case "INFO":
+			handleInfo(conn, line[1:])
+		case "REPLCONF":
+			conn.Write([]byte("+OK\r\n"))
+		case "PSYNC":
+			conn.Write([]byte("+FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0\r\n"))
+			RDBcontent, _ := hex.DecodeString("524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2")
+			conn.Write([]byte(fmt.Sprintf("$%v\r\n%v", len(string(RDBcontent)), string(RDBcontent))))
 		}
+	}
+}
+
+func handleInfo(conn net.Conn, args []string) {
+	if len(args) > 0 && strings.ToUpper(args[0]) == "REPLICATION" {
+		info := []string{
+			fmt.Sprintf("role:%s", role),
+			"master_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",
+			"master_repl_offset:0",
+		}
+		joined := strings.Join(info, "\r\n")
+		resp := fmt.Sprintf("$%d\r\n%s\r\n", len(joined), joined)
+
+		conn.Write([]byte(resp))
 	}
 }
 
@@ -298,6 +321,96 @@ func readRDBintoStore(filePath string) error {
 	return nil
 }
 
+func handleReplication(replicaof, port string) {
+	role = "slave"
+	response := make([]byte, 1024)
+
+	parts := strings.Split(replicaof, " ")
+	if len(parts) != 2 {
+		fmt.Println("invalid replica format")
+		return
+	}
+	masterHost, masterPort := parts[0], parts[1]
+	conn, err := net.Dial("tcp", masterHost+":"+masterPort)
+	if err != nil {
+		fmt.Println(err.Error())
+		return
+	}
+
+	defer conn.Close()
+
+	_, err = conn.Write([]byte("*1\r\n$4\r\nPING\r\n"))
+	if err != nil {
+		fmt.Printf("Failed to send PING command to master at %s: %v\\n\"", masterPort, err)
+	}
+
+	if err != nil {
+		fmt.Println("failed to read from connection ", err)
+		return
+	}
+
+	//read response
+	n, err := conn.Read(response)
+	if err != nil {
+		fmt.Printf("Failed to read PING response: %v\n", err)
+		return
+	}
+	fmt.Printf("PING response: %s", string(response[:n]))
+
+	_, err = conn.Write([]byte("*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$4\r\n6380\r\n"))
+	if err != nil {
+		fmt.Printf("Failed to send REPLCONF command: %v\n", err)
+		return
+	}
+
+	n, err = conn.Read(response)
+	if err != nil {
+		fmt.Printf("Failed to read REPLCONF response: %v\n", err)
+		return
+	}
+	fmt.Printf("REPLCONF response: %s", string(response[:n]))
+
+	_, err = conn.Write([]byte("*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n"))
+	if err != nil {
+		fmt.Printf("Failed to send REPLCONF capa command to master at %s: %v\n", masterPort, err)
+		return
+	}
+
+	n, err = conn.Read(response)
+	if err != nil {
+		fmt.Printf("Failed to read REPLCONF capa response: %v\n", err)
+		return
+	}
+	fmt.Printf("REPLCONF capa response: %s", string(response[:n]))
+
+	_, err = conn.Write([]byte("*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"))
+	if err != nil {
+		fmt.Printf("Failed to send PSYNC command to master at %s: %v\n", masterPort, err)
+		return
+	}
+
+	_, err = conn.Read(response)
+	if err != nil {
+		fmt.Printf("Failed to read PSYNC response: %v\n", err)
+		return
+	}
+	fmt.Printf("PSYNC response: %s", string(response[:n]))
+
+	for {
+		n, err := conn.Read(response)
+		if err != nil {
+			if err == io.EOF {
+				fmt.Println("Master connection closed")
+				break
+			}
+			fmt.Printf("error reading from master: %v\n", err)
+		}
+		if n > 0 {
+			fmt.Printf("recieved from master: %s", string(response[:n]))
+		}
+	}
+}
+
 // Ensures gofmt doesn't remove the "net" and "os" imports in stage 1 (feel free to remove this!)
 var _ = net.Listen
 var _ = os.Exit
@@ -306,10 +419,15 @@ func main() {
 	var dir = flag.String("dir", "", "Directory where RDB file is stored")
 	var dbfilename = flag.String("dbfilename", "", "Name of the RDB file")
 	var port = flag.Int("port", 6379, "port to listen on")
+	var replicaof = flag.String("replicaof", "", "host and port of the master to replicate")
 
 	flag.Parse()
 
 	filePath := path.Join(*dir, *dbfilename)
+
+	if *replicaof != "" {
+		handleReplication(*replicaof, strconv.Itoa(*port))
+	}
 
 	err := readRDBintoStore(filePath)
 	if err != nil {
